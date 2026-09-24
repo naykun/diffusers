@@ -182,6 +182,51 @@ class QwenImage21PipelineTesterConfig(BasePipelineTesterConfig):
 
 
 class TestQwenImage21Pipeline(QwenImage21PipelineTesterConfig, PipelineTesterMixin):
+    @pytest.mark.parametrize("num_inference_steps", [None, 2])
+    def test_sample_sigmas_from_scheduler_config(self, num_inference_steps):
+        pipe = self.get_pipeline()
+        sample_sigmas = [1.0, 0.978453, 0.954180, 0.926626, 0.895080, 0.845148, 0.704534, 0.414568]
+        pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+            pipe.scheduler.config,
+            sample_sigmas=sample_sigmas,
+            use_dynamic_shifting=True,
+            shift_terminal=0.02,
+        )
+        inputs = self.get_dummy_inputs()
+        inputs["output_type"] = "latent"
+        if num_inference_steps is None:
+            inputs.pop("num_inference_steps")
+        else:
+            inputs["num_inference_steps"] = num_inference_steps
+        seen_timesteps = []
+
+        def callback(pipe, step, timestep, callback_kwargs):
+            seen_timesteps.append(timestep.clone())
+            return callback_kwargs
+
+        pipe(**inputs, callback_on_step_end=callback)
+        expected_sigmas = torch.tensor(sample_sigmas + [0.0], device=pipe.scheduler.sigmas.device)
+        expected_timesteps = expected_sigmas[:-1] * pipe.scheduler.config.num_train_timesteps
+        assert torch.equal(pipe.scheduler.sigmas, expected_sigmas)
+        assert torch.equal(pipe.scheduler.timesteps, expected_timesteps)
+        assert torch.equal(torch.stack(seen_timesteps), expected_timesteps)
+        assert pipe.scheduler.num_inference_steps == len(sample_sigmas)
+
+    def test_explicit_sigmas_override_scheduler_config(self):
+        pipe = self.get_pipeline()
+        pipe.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+            pipe.scheduler.config, use_dynamic_shifting=True, shift_terminal=0.02
+        )
+        inputs = self.get_dummy_inputs()
+        inputs.update(sigmas=[1.0, 0.6, 0.2], output_type="latent")
+        expected = pipe(**inputs).images
+        expected_sigmas = pipe.scheduler.sigmas.clone()
+        pipe.scheduler.register_to_config(sample_sigmas=[1.0, 0.8])
+        inputs["generator"] = self.get_generator(0)
+        actual = pipe(**inputs).images
+        assert torch.equal(pipe.scheduler.sigmas, expected_sigmas)
+        assert torch.equal(actual, expected)
+
     @PROCESSOR_REQUIRED_AT_INIT
     def test_encode_prompt_works_in_isolation(self):
         super().test_encode_prompt_works_in_isolation()

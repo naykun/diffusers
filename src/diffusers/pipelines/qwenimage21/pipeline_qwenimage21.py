@@ -720,7 +720,12 @@ class QwenImage21Pipeline(DiffusionPipeline, QwenImageLoraLoaderMixin):
         ] * batch_size
 
         # 4. Prepare timesteps
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
+        if sigmas is None:
+            sample_sigmas = self.scheduler.config.get("sample_sigmas")
+            if sample_sigmas is not None:
+                num_inference_steps = len(sample_sigmas)
+            else:
+                sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
         mu = calculate_shift(
             latents.shape[1],
             self.scheduler.config.get("base_image_seq_len", 256),
