@@ -83,6 +83,12 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
             The type of dynamic resolution-dependent timestep shifting to apply. Either "exponential" or "linear".
         stochastic_sampling (`bool`, defaults to False):
             Whether to use stochastic sampling.
+        sample_sigmas (`list[float]`, *optional*):
+            A fixed list of pre-computed sigma values (descending, excluding the terminal 0) to use as the sampling
+            schedule. When set, `set_timesteps` uses these values directly, **bypassing** dynamic shifting,
+            shift-terminal stretching, and karras/exponential/beta sigma conversions. This is useful for distilled
+            models whose training grid was derived from a specific set of sigma points. The terminal sigma (0) is
+            appended automatically. If `None` (default), sigmas are computed on the fly as usual.
     """
 
     _compatibles = []
@@ -105,6 +111,7 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
         use_beta_sigmas: bool = False,
         time_shift_type: Literal["exponential", "linear"] = "exponential",
         stochastic_sampling: bool = False,
+        sample_sigmas: list[float] | None = None,
     ):
         if self.config.use_beta_sigmas and not is_scipy_available():
             raise ImportError("Make sure to install scipy if you want to use beta sigmas.")
@@ -306,6 +313,33 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
                 Custom values for timesteps to be used for each diffusion step. If `None`, the timesteps are computed
                 automatically.
         """
+        # Fast path: if `sample_sigmas` is set in config and the caller did not pass explicit
+        # sigmas/timesteps, use the pre-computed values directly. This bypasses dynamic shifting,
+        # shift-terminal stretching, and karras/exponential/beta conversions — the stored sigmas are
+        # assumed to be final (e.g. a distilled model's fixed sampling grid).
+        if self.config.sample_sigmas is not None and sigmas is None and timesteps is None:
+            sample_sigmas = np.array(self.config.sample_sigmas, dtype=np.float32)
+            if num_inference_steps is not None and num_inference_steps != len(sample_sigmas):
+                raise ValueError(
+                    f"`num_inference_steps` ({num_inference_steps}) does not match the length of "
+                    f"`sample_sigmas` ({len(sample_sigmas)}) in the scheduler config. Either omit "
+                    f"`num_inference_steps` or pass a value that matches."
+                )
+            self.num_inference_steps = len(sample_sigmas)
+            sigmas_tensor = torch.from_numpy(sample_sigmas).to(dtype=torch.float32, device=device)
+            timesteps = sigmas_tensor * self.config.num_train_timesteps
+            if self.config.invert_sigmas:
+                sigmas_tensor = 1.0 - sigmas_tensor
+                timesteps = sigmas_tensor * self.config.num_train_timesteps
+                sigmas_tensor = torch.cat([sigmas_tensor, torch.ones(1, device=sigmas_tensor.device)])
+            else:
+                sigmas_tensor = torch.cat([sigmas_tensor, torch.zeros(1, device=sigmas_tensor.device)])
+            self.timesteps = timesteps
+            self.sigmas = sigmas_tensor
+            self._step_index = None
+            self._begin_index = None
+            return
+
         if self.config.use_dynamic_shifting and mu is None:
             raise ValueError("`mu` must be passed when `use_dynamic_shifting` is set to be `True`")
 
